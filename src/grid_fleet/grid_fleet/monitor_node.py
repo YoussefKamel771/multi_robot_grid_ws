@@ -26,7 +26,7 @@ class monitorNode(Node):
             10
         )
 
-        self.timer = self.create_timer(1, self.processor)
+        self.timer = self.create_timer(0.5, self.processor)
 
         self.get_logger().info("Monitor Started")
 

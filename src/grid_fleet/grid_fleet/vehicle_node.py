@@ -3,6 +3,9 @@ from rclpy.node import Node
 from grid_interfaces.msg import VehiclePosition, VehicleState
 from grid_interfaces.srv import RequestTask, RequestMove
 import random
+import time
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
 
 class VehicleNode(Node):
     def __init__(self):
@@ -13,19 +16,19 @@ class VehicleNode(Node):
         self.x = random.randint(0, 7)
         self.y = random.randint(0, 7)
         self.state = "IDLE"
-
+        self.waiting_start = None
+    
         self.task_msg = RequestTask.Request()
         self.task_msg.vehicle_id = self.vehicle_id
         self.move_msg = RequestMove.Request()
         self.move_msg.vehicle_id = self.vehicle_id
         
-
         self.position_pub = self.create_publisher(VehiclePosition, '/vehicle_position', 10)
         self.state_pub = self.create_publisher(VehicleState, '/vehicle_state', 10)
 
-        self.task_client = self.create_client(RequestTask, '/request_task')
-        self.move_client = self.create_client(RequestMove, '/request_move')
-
+        self.cb_group = ReentrantCallbackGroup()
+        self.task_client = self.create_client(RequestTask, '/request_task', callback_group=self.cb_group)
+        self.move_client = self.create_client(RequestMove, '/request_move', callback_group=self.cb_group)
 
         self.get_logger().info(f"Started Vehicle with id:{self.vehicle_id}")
 
@@ -37,7 +40,11 @@ class VehicleNode(Node):
             self.get_logger().info("Waiting for move service...")
         
         self.get_logger().info("All services available, starting main loop")
-        self.timer = self.create_timer(1.0, self.loop)
+        self.timer = self.create_timer(1.0, self.loop, callback_group=self.cb_group)
+
+    def wait_for_future(self, future):
+        while not future.done():
+            time.sleep(0.05)
 
     def publish_position(self):
         msg = VehiclePosition()
@@ -45,22 +52,18 @@ class VehicleNode(Node):
         msg.x = self.x
         msg.y = self.y
         self.position_pub.publish(msg)
-        self.get_logger().debug(f"[{self.vehicle_id}] Published position: ({self.x}, {self.y})")
 
     def publish_state(self):
         msg = VehicleState()
         msg.vehicle_id = self.vehicle_id
         msg.state = self.state
         self.state_pub.publish(msg)
-        self.get_logger().debug(f"[{self.vehicle_id}] Published state: {self.state}")
-
 
     def loop(self):
         self.publish_position()
         self.publish_state()
 
         if self.state == "IDLE":
-            self.get_logger().debug(f"[{self.vehicle_id}] Transition: IDLE -> REQUEST_TASK")
             self.state = "REQUEST_TASK"
         
         elif self.state == "REQUEST_TASK":
@@ -73,7 +76,6 @@ class VehicleNode(Node):
             else:
                 self.get_logger().info(f"[{self.vehicle_id}] Pickup reached at ({self.x}, {self.y})")
                 self.state = "MOVING_TO_DROPOFF"
-                return
 
         elif self.state == "MOVING_TO_DROPOFF":
             if self.x != self.dropoff_x or self.y != self.dropoff_y:
@@ -81,25 +83,37 @@ class VehicleNode(Node):
             else:
                 self.get_logger().info(f"[{self.vehicle_id}] Dropoff reached at ({self.x}, {self.y})")
                 self.state = "FINISHED"
-                return
+
         elif self.state == "FINISHED":
+            self.get_logger().info(f"[{self.vehicle_id}] Task finished, Waiting 2 seconds")
+            time.sleep(2)
+            self.get_logger().info(f"[{self.vehicle_id}] Requesting new task")
             self.request_task()
         
         elif self.state == "WAITING":
-            self.get_logger().warn(f"[{self.vehicle_id}] Waiting: retrying last move")
+            if self.waiting_start is None:
+                self.waiting_start = time.time()
+
+            waited = time.time() - self.waiting_start
+
+            if waited > 10.0:
+                self.get_logger().warn(f"[{self.vehicle_id}] Stuck 10s, trying alternative move")
+                self.compute_alternative_move()
+                self.waiting_start = None  # reset timer after trying alternative
+            
             future = self.move_client.call_async(self.move_msg)
-            rclpy.spin_until_future_complete(self, future)
+            self.wait_for_future(future)
             result = future.result()
             if result and result.approved:
                 self.x = self.next_x
                 self.y = self.next_y
-                # Resume previous goal
                 self.state = self.pre_waiting_state
+                self.waiting_start = None  # reset on success too
             
     def request_task(self):
         try:
             future = self.task_client.call_async(self.task_msg)
-            rclpy.spin_until_future_complete(self, future)
+            self.wait_for_future(future)
         except Exception as e:
             self.get_logger().error(f"Task service call failed for vehicle '{self.vehicle_id}': {repr(e)}")
             return
@@ -112,7 +126,7 @@ class VehicleNode(Node):
         if result.success:
             self.task_accepted(result)
         else:
-            self.get_logger().info(f"No task assigned to vehicle '{self.vehicle_id}' (success flag false)")
+            self.get_logger().info(f"No task available for '{self.vehicle_id}'")
 
     def task_accepted(self, result):
         self.pickup_x = result.pickup_x
@@ -121,15 +135,16 @@ class VehicleNode(Node):
         self.dropoff_y = result.dropoff_y
         self.get_logger().info(
             f"[{self.vehicle_id}] New task: "
-            f"Pickup ({result.pickup_x}, {result.pickup_y}) -> "
-            f"Dropoff ({result.dropoff_x}, {result.dropoff_y})"
+            f"Pickup ({self.pickup_x}, {self.pickup_y}) -> "
+            f"Dropoff ({self.dropoff_x}, {self.dropoff_y})"
         )
         self.state = "MOVING_TO_PICKUP"
+        self.publish_state()
  
     def request_pickup_move(self):
         self.compute_next_pickup()
         future = self.move_client.call_async(self.move_msg)
-        rclpy.spin_until_future_complete(self, future)
+        self.wait_for_future(future)
         result = future.result()
         if result is None:
             self.get_logger().warn(f"[{self.vehicle_id}] Move service returned no result (pickup)")
@@ -137,7 +152,7 @@ class VehicleNode(Node):
         if result.approved:
             self.x = self.next_x
             self.y = self.next_y
-            self.get_logger().info(f"[{self.vehicle_id}] Move approved (pickup), new pos=({self.x}, {self.y})")
+            self.get_logger().info(f"[{self.vehicle_id}] Move approved, new pos=({self.x}, {self.y})")
         else:
             self.get_logger().warn(f"[{self.vehicle_id}] Move to pickup not approved, WAITING")
             self.pre_waiting_state = self.state
@@ -146,7 +161,7 @@ class VehicleNode(Node):
     def request_dropoff_move(self):
         self.compute_next_dropoff()
         future = self.move_client.call_async(self.move_msg)
-        rclpy.spin_until_future_complete(self, future)
+        self.wait_for_future(future)
         result = future.result()
         if result is None:
             self.get_logger().warn(f"[{self.vehicle_id}] Move service returned no result (dropoff)")
@@ -154,7 +169,7 @@ class VehicleNode(Node):
         if result.approved:
             self.x = self.next_x
             self.y = self.next_y
-            self.get_logger().info(f"[{self.vehicle_id}] Move approved (pickup), new pos=({self.x}, {self.y})")
+            self.get_logger().info(f"[{self.vehicle_id}] Move approved, new pos=({self.x}, {self.y})")
         else:
             self.get_logger().warn(f"[{self.vehicle_id}] Move to dropoff not approved, WAITING")
             self.pre_waiting_state = self.state
@@ -173,7 +188,6 @@ class VehicleNode(Node):
             self.next_y -= 1
         self.move_msg.target_x = self.next_x
         self.move_msg.target_y = self.next_y
-        self.get_logger().debug(f"[{self.vehicle_id}] compute_next_pickup: ({self.x}, {self.y}) -> ({self.next_x}, {self.next_y})")
 
     def compute_next_dropoff(self):
         self.next_x = self.x
@@ -188,15 +202,38 @@ class VehicleNode(Node):
             self.next_y -= 1
         self.move_msg.target_x = self.next_x
         self.move_msg.target_y = self.next_y
-        self.get_logger().debug(f"[{self.vehicle_id}] compute_next_dropoff: ({self.x}, {self.y}) -> ({self.next_x}, {self.next_y})")
+
+    def compute_alternative_move(self):
+        alternatives = []
+        if self.x > 0: alternatives.append((self.x - 1, self.y))
+        if self.x < 7: alternatives.append((self.x + 1, self.y))
+        if self.y > 0: alternatives.append((self.x, self.y - 1))
+        if self.y < 7: alternatives.append((self.x, self.y + 1))
+
+        blocked = (self.move_msg.target_x, self.move_msg.target_y)
+        alternatives = [a for a in alternatives if a != blocked]
+
+        if self.pre_waiting_state == "MOVING_TO_PICKUP":
+            goal = (self.pickup_x, self.pickup_y)
+        else:
+            goal = (self.dropoff_x, self.dropoff_y)
+
+        best = min(alternatives, key=lambda a: abs(a[0]-goal[0]) + abs(a[1]-goal[1]))
+        self.next_x, self.next_y = best
+        self.move_msg.target_x = self.next_x
+        self.move_msg.target_y = self.next_y
+        self.get_logger().info(f"[{self.vehicle_id}] Alternative move: ({self.x},{self.y}) -> {best}")
 
 def main(args=None):
     rclpy.init(args=args)
     node = VehicleNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
-
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
