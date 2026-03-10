@@ -117,8 +117,9 @@ class VehicleNode(Node):
         # Call the service asynchronously
         future = self.task_client.call_async(request)
 
-        rclpy.spin_until_future_complete(self, future)
-
+        # wait for response without recursive spin
+        while rclpy.ok() and not future.done():
+            time.sleep(0.1)
 
         response = future.result()
 
@@ -172,7 +173,11 @@ class VehicleNode(Node):
         request.target_y   = next_y
 
         future = self.move_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future)
+        
+        # wait for response without recursive spin
+        while rclpy.ok() and not future.done():
+            time.sleep(0.1)
+
         response = future.result()
 
         if response is None:
@@ -187,7 +192,7 @@ class VehicleNode(Node):
             self.y = next_y
             self.publish_position()
             self.get_logger().info(f'[{self.vehicle_id}] Moved to ({self.x},{self.y})')
-            time.sleep(0.3)
+            time.sleep(1.0)
 
         else:
             # Permission denied — another vehicle is in the way.
