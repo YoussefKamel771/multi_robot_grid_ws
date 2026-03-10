@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'monitor_node = grid_fleet.monitor_node:main',
+            'vehicle_node = grid_fleet.vehicle_node:main',
         ],
     },
 )
